@@ -1,0 +1,230 @@
+name: Contribution Stats
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 1 * *'
+
+permissions:
+  contents: write
+
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate contribution stats
+        env:
+          GH_TOKEN: ${{ secrets.FORKS_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          report_dir="reports"
+          report_file="$report_dir/contribution_stats.md"
+          mkdir -p "$report_dir"
+
+          username=$(gh api user -q '.login')
+          echo "👤 User: $username"
+
+          # Calculate date ranges
+          now=$(date -u +'%Y-%m-%d')
+          month_start=$(date -u -d "$(date -u +'%Y-%m-01')" +'%Y-%m-%d')
+          last_month_start=$(date -u -d "$(date -u +'%Y-%m-01') -1 month" +'%Y-%m-%d')
+          last_month_end=$(date -u -d "$(date -u +'%Y-%m-01') -1 day" +'%Y-%m-%d')
+          year_start=$(date -u +'%Y-01-01' +'%Y-%m-%d')
+
+          echo "📅 Period: $month_start to $now"
+
+          {
+            echo "# Contribution Stats"
+            echo ""
+            echo "Auto-generated on: $now UTC"
+            echo "User: @$username"
+            echo ""
+            echo "Monthly overview of your open source activity. Includes aggregate counts from both public and private repositories."
+            echo ""
+            echo "---"
+            echo ""
+            echo "## This Month ($month_start → $now)"
+            echo ""
+          } > "$report_file"
+
+          # --- Pull Requests ---
+          echo "🔍 Fetching PR data..."
+
+          # PRs created this month (all repos, public + private)
+          prs_opened=$(gh search prs --author "$username" --created "$month_start..$now" --limit 200 --json url 2>/dev/null | jq 'length' || echo 0)
+          prs_merged=$(gh search prs --author "$username" --merged "$month_start..$now" --limit 200 --json url 2>/dev/null | jq 'length' || echo 0)
+          prs_open=$(gh search prs --author "$username" --state open --limit 200 --json url 2>/dev/null | jq 'length' || echo 0)
+
+          # PRs created this year
+          prs_year=$(gh search prs --author "$username" --created "$year_start..$now" --limit 500 --json url 2>/dev/null | jq 'length' || echo 0)
+          prs_merged_year=$(gh search prs --author "$username" --merged "$year_start..$now" --limit 500 --json url 2>/dev/null | jq 'length' || echo 0)
+
+          {
+            echo "### Pull Requests"
+            echo ""
+            echo "| Metric | This Month | This Year |"
+            echo "| --- | --- | --- |"
+            echo "| PRs opened | $prs_opened | $prs_year |"
+            echo "| PRs merged | $prs_merged | $prs_merged_year |"
+            echo "| Currently open | $prs_open | — |"
+            echo ""
+          } >> "$report_file"
+
+          # --- Issues ---
+          echo "🔍 Fetching issue data..."
+
+          issues_opened=$(gh search issues --author "$username" --created "$month_start..$now" --limit 200 --json url 2>/dev/null | jq 'length' || echo 0)
+          issues_closed=$(gh search issues --author "$username" --closed "$month_start..$now" --limit 200 --json url 2>/dev/null | jq 'length' || echo 0)
+          issues_year=$(gh search issues --author "$username" --created "$year_start..$now" --limit 500 --json url 2>/dev/null | jq 'length' || echo 0)
+
+          {
+            echo "### Issues"
+            echo ""
+            echo "| Metric | This Month | This Year |"
+            echo "| --- | --- | --- |"
+            echo "| Issues opened | $issues_opened | $issues_year |"
+            echo "| Issues closed | $issues_closed | — |"
+            echo ""
+          } >> "$report_file"
+
+          # --- Commits ---
+          echo "🔍 Fetching commit data..."
+
+          commits_month=$(gh search commits --author "$username" --created "$month_start..$now" --limit 500 --json sha 2>/dev/null | jq 'length' || echo 0)
+          commits_year=$(gh search commits --author "$username" --created "$year_start..$now" --limit 1000 --json sha 2>/dev/null | jq 'length' || echo 0)
+
+          {
+            echo "### Commits"
+            echo ""
+            echo "| Metric | This Month | This Year |"
+            echo "| --- | --- | --- |"
+            echo "| Commits authored | $commits_month | $commits_year |"
+            echo ""
+          } >> "$report_file"
+
+          # --- Repositories ---
+          echo "🔍 Fetching repository data..."
+
+          total_repos=$(gh repo list "$username" --limit 500 --json nameWithOwner,isPrivate,isFork 2>/dev/null | jq 'length' || echo 0)
+          private_repos=$(gh repo list "$username" --limit 500 --json nameWithOwner,isPrivate 2>/dev/null | jq '[.[] | select(.isPrivate == true)] | length' || echo 0)
+          public_repos=$((total_repos - private_repos))
+          fork_repos=$(gh repo list "$username" --limit 500 --json nameWithOwner,isFork 2>/dev/null | jq '[.[] | select(.isFork == true)] | length' || echo 0)
+          own_repos=$((total_repos - fork_repos))
+
+          {
+            echo "### Repositories"
+            echo ""
+            echo "| Metric | Count |"
+            echo "| --- | --- |"
+            echo "| Total repositories | $total_repos |"
+            echo "| Public | $public_repos |"
+            echo "| Private | $private_repos |"
+            echo "| Own (non-fork) | $own_repos |"
+            echo "| Forks | $fork_repos |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Activity Score"
+            echo ""
+          } >> "$report_file"
+
+          # Simple activity score: weighted sum
+          # PRs merged weight 5, PRs opened weight 2, issues opened weight 1, commits weight 0.1
+          score=$(python3 -c "
+            prs_merged = $prs_merged
+            prs_opened = $prs_opened
+            issues_opened = $issues_opened
+            commits = $commits_month
+            score = (prs_merged * 5) + (prs_opened * 2) + (issues_opened * 1) + (commits * 0.1)
+            print(round(score, 1))
+          " 2>/dev/null || echo "N/A")
+
+          {
+            echo "| Metric | Value |"
+            echo "| --- | --- |"
+            echo "| Monthly activity score | **$score** |"
+            echo ""
+            echo "> Score = (PRs merged × 5) + (PRs opened × 2) + (Issues opened × 1) + (Commits × 0.1)"
+            echo "> A score above 20 indicates highly active contribution."
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Trend"
+            echo ""
+            echo "```"
+            echo "Month               PRs  Merged  Issues  Commits  Score"
+            echo "─────────────────── ──── ─────── ─────── ──────── ─────"
+          } >> "$report_file"
+
+          # Append current month to trend (simple text-based, no external deps)
+          month_label=$(date -u +'%b %Y')
+          printf "%-19s %-4s %-7s %-7s %-8s %s\n" "$month_label" "$prs_opened" "$prs_merged" "$issues_opened" "$commits_month" "$score" >> "$report_file"
+
+          # Load previous trend if exists
+          trend_file="$report_dir/.contribution_trend.csv"
+          if [ -f "$trend_file" ]; then
+            while IFS=',' read -r m p pm i c s; do
+              printf "%-19s %-4s %-7s %-7s %-8s %s\n" "$m" "$p" "$pm" "$i" "$c" "$s" >> "$report_file"
+            done < "$trend_file"
+          fi
+
+          # Save current month to trend file
+          echo "$month_label,$prs_opened,$prs_merged,$issues_opened,$commits_month,$score" >> "$trend_file"
+
+          {
+            echo "```"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Notes"
+            echo ""
+            echo "- Counts include **both public and private repositories** (aggregate numbers only, no sensitive details)."
+            echo "- The GitHub Search API has rate limits; very active accounts may see capped results."
+            echo "- Run this workflow manually anytime for fresh stats."
+          } >> "$report_file"
+
+          echo "----------------------------------------"
+          echo "📊 Contribution stats generated:"
+          echo "   - PRs this month:      $prs_opened ($prs_merged merged)"
+          echo "   - Issues this month:   $issues_opened"
+          echo "   - Commits this month:  $commits_month"
+          echo "   - Activity score:      $score"
+          echo "   - Total repos:         $total_repos ($public_repos public, $private_repos private)"
+
+      - name: Inject report into README
+        run: |
+          python3 << 'EOF'
+          import re
+
+          with open('README.md', 'r') as f:
+              readme = f.read()
+          with open('reports/contribution_stats.md', 'r') as f:
+              report = f.read()
+
+          # Demote headings by 2 levels to fit within README structure
+          report = re.sub(r'^(#+)', r'\1##', report, flags=re.MULTILINE)
+
+          # Replace content between markers
+          begin_marker = '<!-- BEGIN: contribution-stats -->'
+          end_marker = '<!-- END: contribution-stats -->'
+          begin_idx = readme.index(begin_marker) + len(begin_marker) + 1
+          end_idx = readme.index(end_marker) - 1
+          readme = readme[:begin_idx] + report + readme[end_idx:]
+
+          with open('README.md', 'w') as f:
+              f.write(readme)
+          EOF
+
+      - name: Commit and push report
+        run: |
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "actions@github.com"
+          git add reports/contribution_stats.md reports/.contribution_trend.csv README.md
+          git diff --quiet && git diff --staged --quiet || (
+            git commit -m "docs: update contribution stats [skip ci]"
+            git push
+          )

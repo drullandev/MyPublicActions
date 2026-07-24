@@ -1,0 +1,205 @@
+name: Watch Upstream Releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate release watcher report
+        env:
+          GH_TOKEN: ${{ secrets.FORKS_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          report_dir="reports"
+          report_file="$report_dir/release_watcher.md"
+          state_file="$report_dir/.release_state.json"
+          mkdir -p "$report_dir"
+
+          {
+            echo "# Upstream Release Watcher"
+            echo ""
+            echo "Auto-generated on: $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
+            echo ""
+            echo "Tracks new releases in the upstream (parent) repositories of your forks."
+            echo ""
+          } > "$report_file"
+
+          echo "🔎 Fetching all your forks..."
+          forks=$(gh repo list --fork --json nameWithOwner -q '.[].nameWithOwner' --limit 200)
+
+          if [ -z "$forks" ]; then
+            echo "No forks found."
+            echo "No forked repositories found." >> "$report_file"
+            exit 0
+          fi
+
+          total_forks=$(echo "$forks" | wc -l)
+          echo "📋 Found $total_forks forks."
+
+          # Load previous state (last known release per repo)
+          if [ -f "$state_file" ]; then
+            prev_state=$(cat "$state_file")
+          else
+            prev_state="{}"
+          fi
+
+          new_state="{}"
+          new_releases=0
+          repos_with_releases=0
+
+          {
+            echo "## Summary"
+            echo ""
+            echo "| Metric | Count |"
+            echo "| --- | --- |"
+            echo "| Forks analyzed | $total_forks |"
+          } >> "$report_file"
+
+          for repo in $forks; do
+            echo "🔄 Checking $repo..."
+            parent=$(gh repo view "$repo" --json parent -q '.parent.nameWithOwner' 2>/dev/null || true)
+
+            if [ -z "$parent" ] || [ "$parent" = "null" ]; then
+              continue
+            fi
+
+            # Get latest release (not pre-release tags, actual releases)
+            latest=$(gh release list -R "$parent" --limit 5 --json tagName,publishedAt,isLatest,isPrerelease 2>/dev/null || true)
+
+            if [ -z "$latest" ] || [ "$latest" = "[]" ]; then
+              continue
+            fi
+
+            repos_with_releases=$((repos_with_releases + 1))
+
+            latest_tag=$(echo "$latest" | jq -r '.[0].tagName')
+            latest_date=$(echo "$latest" | jq -r '.[0].publishedAt[:10]')
+            is_prerelease=$(echo "$latest" | jq -r '.[0].isPrerelease')
+
+            # Check if this is new compared to previous state
+            prev_tag=$(echo "$prev_state" | jq -r --arg repo "$parent" '.[$repo].tag // empty')
+
+            is_new="no"
+            if [ -n "$prev_tag" ] && [ "$prev_tag" != "$latest_tag" ]; then
+              is_new="yes"
+              new_releases=$((new_releases + 1))
+            elif [ -z "$prev_tag" ]; then
+              # First time seeing this repo
+              is_new="first-seen"
+            fi
+
+            # Update state
+            new_state=$(echo "$new_state" | jq --arg repo "$parent" --arg tag "$latest_tag" --arg date "$latest_date" \
+              '.[$repo] = {tag: $tag, date: $date}')
+
+            badge=""
+            if [ "$is_new" = "yes" ]; then
+              badge=" 🆕"
+            elif [ "$is_new" = "first-seen" ]; then
+              badge=" (first seen)"
+            fi
+
+            pre_badge=""
+            if [ "$is_prerelease" = "true" ]; then
+              pre_badge=" (pre-release)"
+            fi
+
+            {
+              echo ""
+              echo "### [$parent](https://github.com/$parent)$badge"
+              echo ""
+              echo "| Latest Release | Published | Pre-release | Your fork |"
+              echo "| --- | --- | --- | --- |"
+              echo "| [$latest_tag](https://github.com/$parent/releases/tag/$latest_tag) | $latest_date | $is_prerelease | [$repo](https://github.com/$repo) |"
+            } >> "$report_file"
+
+            # Show recent releases if more than 1
+            recent_count=$(echo "$latest" | jq 'length')
+            if [ "$recent_count" -gt 1 ]; then
+              {
+                echo ""
+                echo "<details><summary>Recent releases</summary>"
+                echo ""
+                echo "| Tag | Date | Pre-release |"
+                echo "| --- | --- | --- |"
+              } >> "$report_file"
+              echo "$latest" | jq -r '.[] | "| \(.tagName) | \(.publishedAt[:10]) | \(.isPrerelease) |"' >> "$report_file"
+              echo "" >> "$report_file"
+              echo "</details>" >> "$report_file"
+            fi
+
+          done
+
+          # Finalize summary
+          {
+            echo "| Repos with releases | $repos_with_releases |"
+            echo "| New releases since last run | $new_releases |"
+            echo ""
+            if [ "$new_releases" -gt 0 ]; then
+              echo "> ⚠️ **$new_releases new release(s) detected!** Consider syncing your forks (run *Sync All Forks*)."
+            else
+              echo "> No new releases since last check. All up to date."
+            fi
+            echo ""
+            echo "---"
+            echo ""
+            echo "## How to use"
+            echo ""
+            echo "1. If there are new releases (🆕), go to the **Actions** tab and run *Sync All Forks*."
+            echo "2. Review the changelog of the new release to understand breaking changes."
+            echo "3. Update your `development` branch accordingly before submitting new PRs."
+          } >> "$report_file"
+
+          # Save state for next run
+          echo "$new_state" | jq '.' > "$state_file"
+
+          echo "----------------------------------------"
+          echo "📊 Summary:"
+          echo "   - Forks analyzed:    $total_forks"
+          echo "   - Repos w/ releases: $repos_with_releases"
+          echo "   - New releases:      $new_releases"
+
+      - name: Inject report into README
+        run: |
+          python3 << 'EOF'
+          import re
+
+          with open('README.md', 'r') as f:
+              readme = f.read()
+          with open('reports/release_watcher.md', 'r') as f:
+              report = f.read()
+
+          # Demote headings by 2 levels to fit within README structure
+          report = re.sub(r'^(#+)', r'\1##', report, flags=re.MULTILINE)
+
+          # Replace content between markers
+          begin_marker = '<!-- BEGIN: release-watcher -->'
+          end_marker = '<!-- END: release-watcher -->'
+          begin_idx = readme.index(begin_marker) + len(begin_marker) + 1
+          end_idx = readme.index(end_marker) - 1
+          readme = readme[:begin_idx] + report + readme[end_idx:]
+
+          with open('README.md', 'w') as f:
+              f.write(readme)
+          EOF
+
+      - name: Commit and push report
+        run: |
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "actions@github.com"
+          git add reports/release_watcher.md reports/.release_state.json README.md
+          git diff --quiet && git diff --staged --quiet || (
+            git commit -m "docs: update release watcher report [skip ci]"
+            git push
+          )

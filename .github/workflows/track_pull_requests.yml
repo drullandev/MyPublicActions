@@ -1,0 +1,139 @@
+name: Track Pull Requests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate PR tracker report
+        env:
+          GH_TOKEN: ${{ secrets.FORKS_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          report_dir="reports"
+          report_file="$report_dir/pr_tracker.md"
+          mkdir -p "$report_dir"
+
+          {
+            echo "# Pull Request Tracker"
+            echo ""
+            echo "Auto-generated on: $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
+            echo ""
+            echo "Status of your open pull requests in upstream repositories."
+            echo ""
+          } > "$report_file"
+
+          echo "🔎 Fetching your pull requests..."
+          # Get all PRs authored by the token owner across all repos
+          username=$(gh api user -q '.login')
+          echo "   User: $username"
+
+          # Search for open PRs authored by this user
+          prs_json=$(gh search prs --author "$username" --state open --limit 100 \
+            --json repository,title,number,state,url,createdAt,updatedAt,isDraft 2>/dev/null || true)
+
+          if [ -z "$prs_json" ] || [ "$prs_json" = "[]" ]; then
+            echo "No open PRs found."
+            {
+              echo "## No open pull requests"
+              echo ""
+              echo "You have no open pull requests in any repository. Time to find new issues to work on! Check \`reports/issues_report.md\`."
+            } >> "$report_file"
+          else
+            pr_count=$(echo "$prs_json" | jq 'length')
+            echo "📋 Found $pr_count open PRs."
+
+            {
+              echo "## Summary"
+              echo ""
+              echo "| Metric | Count |"
+              echo "| --- | --- |"
+              echo "| Total open PRs | $pr_count |"
+              echo ""
+              echo "## Open Pull Requests"
+              echo ""
+              echo "| Repo | # | Title | Draft | Opened | Last Updated | Link |"
+              echo "| --- | --- | --- | --- | --- | --- | --- |"
+            } >> "$report_file"
+
+            echo "$prs_json" | jq -r '.[] | sort_by(.updatedAt) | .[] | "| \(.repository) | #\(.number) | \(.title) | \(.isDraft | if true then "yes" else "no") | \(.createdAt[:10]) | \(.updatedAt[:10]) | [view](\(.url)) |"' >> "$report_file"
+
+            # Flag stale PRs (no update in 14+ days)
+            {
+              echo ""
+              echo "## Stale PRs (no activity in 14+ days)"
+              echo ""
+            } >> "$report_file"
+
+            stale=$(echo "$prs_json" | jq -r --arg cutoff "$(date -u -d '14 days ago' +'%Y-%m-%d')" \
+              '[.[] | select(.updatedAt[:10] <= $cutoff)] | length')
+
+            if [ "$stale" = "0" ]; then
+              echo "None — all your PRs have recent activity. 🎉" >> "$report_file"
+            else
+              echo "$prs_json" | jq -r --arg cutoff "$(date -u -d '14 days ago' +'%Y-%m-%d')" \
+                '.[] | select(.updatedAt[:10] <= $cutoff) | "- [**\(.repository)#\(.number)**](\(.url)) — \(.title) (last updated: \(.updatedAt[:10]))"' >> "$report_file"
+              {
+                echo ""
+                echo "> Consider leaving a comment on these PRs to ping maintainers."
+              } >> "$report_file"
+            fi
+
+            {
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Tips"
+              echo ""
+              echo "- If a PR is stale, leave a polite comment asking for a review."
+              echo "- If a PR has change requests, address them promptly."
+              echo "- Link your PR to the issue it fixes using \`Closes #NNN\` in the description."
+            } >> "$report_file"
+          fi
+
+          echo "✅ Report generated at $report_file"
+
+      - name: Inject report into README
+        run: |
+          python3 << 'EOF'
+          import re
+
+          with open('README.md', 'r') as f:
+              readme = f.read()
+          with open('reports/pr_tracker.md', 'r') as f:
+              report = f.read()
+
+          # Demote headings by 2 levels to fit within README structure
+          report = re.sub(r'^(#+)', r'\1##', report, flags=re.MULTILINE)
+
+          # Replace content between markers
+          begin_marker = '<!-- BEGIN: pr-tracker -->'
+          end_marker = '<!-- END: pr-tracker -->'
+          begin_idx = readme.index(begin_marker) + len(begin_marker) + 1
+          end_idx = readme.index(end_marker) - 1
+          readme = readme[:begin_idx] + report + readme[end_idx:]
+
+          with open('README.md', 'w') as f:
+              f.write(readme)
+          EOF
+
+      - name: Commit and push report
+        run: |
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "actions@github.com"
+          git add reports/pr_tracker.md README.md
+          git diff --quiet && git diff --staged --quiet || (
+            git commit -m "docs: update PR tracker report [skip ci]"
+            git push
+          )

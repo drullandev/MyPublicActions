@@ -1,0 +1,185 @@
+name: Report Fork Issues
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 12 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate issues report
+        env:
+          GH_TOKEN: ${{ secrets.FORKS_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          report_dir="reports"
+          report_file="$report_dir/issues_report.md"
+          mkdir -p "$report_dir"
+
+          {
+            echo "# Open Source Issues Report"
+            echo ""
+            echo "Auto-generated on: $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
+            echo ""
+            echo "This report consolidates open issues reported by the community in the upstream (parent) repositories of your forks. Use it to find bugs to fix and start contributing to open source."
+            echo ""
+          } > "$report_file"
+
+          echo "🔎 Fetching all your forks..."
+          forks=$(gh repo list --fork --json nameWithOwner -q '.[].nameWithOwner' --limit 200)
+
+          if [ -z "$forks" ]; then
+            echo "No forks found in your account."
+            {
+              echo "## No forks found"
+              echo ""
+              echo "No forked repositories were found in your account."
+            } >> "$report_file"
+            exit 0
+          fi
+
+          total_forks=$(echo "$forks" | wc -l)
+          echo "📋 Found $total_forks forks."
+          echo "----------------------------------------"
+
+          repos_with_issues=0
+          total_issues=0
+          good_first_issues=0
+          help_wanted_issues=0
+
+          {
+            echo "## Summary"
+            echo ""
+            echo "| Metric | Count |"
+            echo "| --- | --- |"
+            echo "| Forks analyzed | $total_forks |"
+          } >> "$report_file"
+
+          # Placeholder for summary counts, will be updated later
+          summary_placeholder_line=$(grep -n "Forks analyzed" "$report_file" | cut -d: -f1)
+
+          for repo in $forks; do
+            echo "🔄 Processing fork: $repo"
+
+            parent=$(gh repo view "$repo" --json parent -q '.parent.nameWithOwner' 2>/dev/null || true)
+
+            if [ -z "$parent" ] || [ "$parent" = "null" ]; then
+              echo "⚠️  No parent repository found for $repo. Skipping..."
+              continue
+            fi
+
+            echo "   ↳ Upstream: $parent"
+
+            {
+              echo ""
+              echo "## [$parent](https://github.com/$parent)"
+              echo ""
+              echo "Your fork: [$repo](https://github.com/$repo)"
+              echo ""
+            } >> "$report_file"
+
+            # Fetch open issues from the parent (upstream) repo
+            issues_json=$(gh issue list -R "$parent" --state open --limit 30 \
+              --json number,title,labels,url,createdAt,updatedAt 2>/dev/null || true)
+
+            if [ -z "$issues_json" ] || [ "$issues_json" = "[]" ]; then
+              echo "   ↳ No open issues found."
+              {
+                echo "> No open issues found in this repository."
+                echo ""
+              } >> "$report_file"
+              continue
+            fi
+
+            repos_with_issues=$((repos_with_issues + 1))
+
+            issue_count=$(echo "$issues_json" | jq 'length')
+            total_issues=$((total_issues + issue_count))
+
+            {
+              echo "| # | Title | Labels | Created | Updated | Link |"
+              echo "| --- | --- | --- | --- | --- | --- |"
+            } >> "$report_file"
+
+            echo "$issues_json" | jq -r '.[] | "| #\(.number) | \(.title) | \(.labels | map(.name) | join(", ")) | \(.createdAt[:10]) | \(.updatedAt[:10]) | [view](\(.url)) |"' >> "$report_file"
+
+            # Count beginner-friendly labels
+            gfi=$(echo "$issues_json" | jq '[.[] | select(.labels[].name == "good first issue")] | length' 2>/dev/null || echo 0)
+            hw=$(echo "$issues_json" | jq '[.[] | select(.labels[].name == "help wanted")] | length' 2>/dev/null || echo 0)
+            good_first_issues=$((good_first_issues + gfi))
+            help_wanted_issues=$((help_wanted_issues + hw))
+
+            echo "   ↳ Found $issue_count open issues ($gfi good first issue, $hw help wanted)."
+            echo "" >> "$report_file"
+          done
+
+          # Update summary table with final counts
+          {
+            echo "| Repos with open issues | $repos_with_issues |"
+            echo "| Total open issues | $total_issues |"
+            echo "| Good first issues | $good_first_issues |"
+            echo "| Help wanted issues | $help_wanted_issues |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## How to use this report"
+            echo ""
+            echo "1. Pick an issue that interests you (prioritize \`good first issue\` or \`help wanted\` labels)."
+            echo "2. Create a \`development\` branch in your fork."
+            echo "3. Work on the fix referencing the issue number in your commits."
+            echo "4. Open a Pull Request from your fork to the upstream repository."
+            echo ""
+            echo "> Tip: Comment on the issue saying you're working on it to avoid duplicate work."
+          } >> "$report_file"
+
+          echo "----------------------------------------"
+          echo "📊 Report summary:"
+          echo "   - Forks analyzed:       $total_forks"
+          echo "   - Repos with issues:    $repos_with_issues"
+          echo "   - Total open issues:    $total_issues"
+          echo "   - Good first issues:    $good_first_issues"
+          echo "   - Help wanted issues:   $help_wanted_issues"
+
+      - name: Inject report into README
+        run: |
+          python3 << 'EOF'
+          import re
+
+          with open('README.md', 'r') as f:
+              readme = f.read()
+          with open('reports/issues_report.md', 'r') as f:
+              report = f.read()
+
+          # Demote headings by 2 levels to fit within README structure
+          report = re.sub(r'^(#+)', r'\1##', report, flags=re.MULTILINE)
+
+          # Replace content between markers
+          begin_marker = '<!-- BEGIN: fork-issues -->'
+          end_marker = '<!-- END: fork-issues -->'
+          begin_idx = readme.index(begin_marker) + len(begin_marker) + 1
+          end_idx = readme.index(end_marker) - 1
+          readme = readme[:begin_idx] + report + readme[end_idx:]
+
+          with open('README.md', 'w') as f:
+              f.write(readme)
+          EOF
+
+      - name: Commit and push report
+        run: |
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "actions@github.com"
+          git add reports/issues_report.md README.md
+          # Only commit if there are changes
+          git diff --quiet && git diff --staged --quiet || (
+            git commit -m "docs: update fork issues report [skip ci]"
+            git push
+          )

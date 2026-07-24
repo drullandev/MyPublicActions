@@ -1,0 +1,175 @@
+name: Hunt Good First Issues
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 10 * * 1'
+
+permissions:
+  contents: write
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Hunt for good first issues
+        env:
+          GH_TOKEN: ${{ secrets.FORKS_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          report_dir="reports"
+          report_file="$report_dir/good_first_issues.md"
+          mkdir -p "$report_dir"
+
+          {
+            echo "# Good First Issues Hunter"
+            echo ""
+            echo "Auto-generated on: $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
+            echo ""
+            echo "Curated list of beginner-friendly issues across popular open source repositories. These are great entry points for contributing to open source."
+            echo ""
+          } > "$report_file"
+
+          username=$(gh api user -q '.login')
+          echo "👤 User: $username"
+
+          # Define topic/label combinations to search
+          # We search for good first issues in popular languages
+          languages=("typescript" "javascript" "python" "go" "rust" "java" "c#" "c++")
+
+          total_found=0
+
+          {
+            echo "## Summary"
+            echo ""
+            echo "| Metric | Count |"
+            echo "| --- | --- |"
+          } >> "$report_file"
+
+          summary_line_num=$(grep -n "Forks analyzed\|Metric" "$report_file" | tail -1 | cut -d: -f1)
+
+          {
+            echo ""
+            echo "## Issues by Language"
+            echo ""
+          } >> "$report_file"
+
+          for lang in "${languages[@]}"; do
+            echo "🔍 Hunting good first issues in $lang..."
+
+            # Search for good first issues, sorted by recently updated, with most stars
+            issues_json=$(gh search issues \
+              --label "good first issue" \
+              --state open \
+              --language "$lang" \
+              --sort updated \
+              --limit 15 \
+              --json repository,title,number,url,createdAt,updatedAt,labels 2>/dev/null || true)
+
+            if [ -z "$issues_json" ] || [ "$issues_json" = "[]" ]; then
+              echo "   ↳ No issues found for $lang."
+              continue
+            fi
+
+            count=$(echo "$issues_json" | jq 'length')
+            total_found=$((total_found + count))
+            echo "   ↳ Found $count issues."
+
+            {
+              echo "### $lang"
+              echo ""
+              echo "| # | Title | Repo | Updated | Link |"
+              echo "| --- | --- | --- | --- | --- |"
+            } >> "$report_file"
+
+            echo "$issues_json" | jq -r '.[] | "| #\(.number) | \(.title) | \(.repository) | \(.updatedAt[:10]) | [view](\(.url)) |"' >> "$report_file"
+
+            echo "" >> "$report_file"
+          done
+
+          # Also search for help wanted issues in trending repos
+          echo "🔍 Hunting help wanted issues across all languages..."
+          help_json=$(gh search issues \
+            --label "help wanted" \
+            --state open \
+            --sort updated \
+            --limit 20 \
+            --json repository,title,number,url,createdAt,updatedAt,labels 2>/dev/null || true)
+
+          help_count=0
+          if [ -n "$help_json" ] && [ "$help_json" != "[]" ]; then
+            help_count=$(echo "$help_json" | jq 'length')
+            total_found=$((total_found + help_count))
+            echo "   ↳ Found $help_count help wanted issues."
+
+            {
+              echo "### Help Wanted (all languages)"
+              echo ""
+              echo "| # | Title | Repo | Updated | Link |"
+              echo "| --- | --- | --- | --- | --- |"
+            } >> "$report_file"
+
+            echo "$help_json" | jq -r '.[] | "| #\(.number) | \(.title) | \(.repository) | \(.updatedAt[:10]) | [view](\(.url)) |"' >> "$report_file"
+            echo "" >> "$report_file"
+          fi
+
+          # Update summary
+          {
+            echo "| Total issues found | $total_found |"
+            echo "| Good first issues | $((total_found - help_count)) |"
+            echo "| Help wanted issues | $help_count |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## How to start"
+            echo ""
+            echo "1. Pick an issue that matches your skills and interests."
+            echo "2. Check if someone is already working on it (read the comments)."
+            echo "3. Comment on the issue: \`I'd like to work on this, is anyone already assigned?\`"
+            echo "4. Fork the repo (if you haven't already)."
+            echo "5. Create a \`development\` branch and start coding."
+            echo "6. Open a PR referencing the issue: \`Closes #NNN\`"
+            echo ""
+            echo "> Tip: Start with small issues. A quick merged PR builds trust with maintainers for bigger contributions."
+          } >> "$report_file"
+
+          echo "----------------------------------------"
+          echo "📊 Total issues found: $total_found"
+
+      - name: Inject report into README
+        run: |
+          python3 << 'EOF'
+          import re
+
+          with open('README.md', 'r') as f:
+              readme = f.read()
+          with open('reports/good_first_issues.md', 'r') as f:
+              report = f.read()
+
+          # Demote headings by 2 levels to fit within README structure
+          report = re.sub(r'^(#+)', r'\1##', report, flags=re.MULTILINE)
+
+          # Replace content between markers
+          begin_marker = '<!-- BEGIN: good-first-issues -->'
+          end_marker = '<!-- END: good-first-issues -->'
+          begin_idx = readme.index(begin_marker) + len(begin_marker) + 1
+          end_idx = readme.index(end_marker) - 1
+          readme = readme[:begin_idx] + report + readme[end_idx:]
+
+          with open('README.md', 'w') as f:
+              f.write(readme)
+          EOF
+
+      - name: Commit and push report
+        run: |
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "actions@github.com"
+          git add reports/good_first_issues.md README.md
+          git diff --quiet && git diff --staged --quiet || (
+            git commit -m "docs: update good first issues report [skip ci]"
+            git push
+          )
