@@ -22,7 +22,7 @@ A GitHub Action iterates over every fork in your account and runs `gh repo sync`
 
 1. In this repository, go to **Settings → Secrets and variables → Actions**.
 2. Click **New repository secret**.
-3. Name: `MI_GITHUB_TOKEN`
+3. Name: `FORKS_SYNC_TOKEN`
 4. Value: paste the token from the previous step.
 
 ### 3. Run it

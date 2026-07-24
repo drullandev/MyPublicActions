@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Sync repositories
         env:
-          GH_TOKEN: ${{ secrets.MI_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.FORKS_SYNC_TOKEN }}
         run: |
           set -euo pipefail
 
