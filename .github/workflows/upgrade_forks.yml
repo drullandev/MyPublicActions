@@ -1,0 +1,49 @@
+name: Sync All Forks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 1'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync repositories
+        env:
+          GH_TOKEN: ${{ secrets.MI_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "🔎 Fetching all your forks..."
+          forks=$(gh repo list --fork --json nameWithOwner -q '.[].nameWithOwner' --limit 200)
+
+          if [ -z "$forks" ]; then
+            echo "No forks found in your account."
+            exit 0
+          fi
+
+          total=$(echo "$forks" | wc -l)
+          echo "📋 Found $total forks."
+          echo "----------------------------------------"
+
+          success=0
+          failed=0
+
+          for repo in $forks; do
+            echo "🔄 Syncing $repo..."
+            if gh repo sync "$repo" 2>&1; then
+              echo "✅ $repo synced successfully."
+              success=$((success + 1))
+            else
+              echo "⚠️  Failed to sync $repo (possible conflicts or local changes)."
+              failed=$((failed + 1))
+            fi
+            echo "----------------------------------------"
+          done
+
+          echo ""
+          echo "📊 Summary:"
+          echo "   - Total forks:  $total"
+          echo "   - Synced:       $success"
+          echo "   - Failed:       $failed"
